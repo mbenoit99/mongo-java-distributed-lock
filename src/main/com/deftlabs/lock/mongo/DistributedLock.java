@@ -31,7 +31,7 @@ public interface DistributedLock extends Lock {
      * Returns true if the lock is currently locked by the local process.
      */
     public boolean isLocked();
-
+    
     /**
      * Returns the lock name.
      */
@@ -46,6 +46,11 @@ public interface DistributedLock extends Lock {
      * Returns the options used to configure this lock.
      */
     public DistributedLockOptions getOptions();
+    
+    /**
+     * Updates the last time this lock successfully updated its heartbeat.
+     */
+    public void setLastHeartbeat(final long pWhen);
 
     /**
      * Wakeup any blocked threads. This should <b>ONLY</b> be used by the lock service,

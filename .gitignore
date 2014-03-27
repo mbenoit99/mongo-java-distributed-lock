@@ -3,3 +3,6 @@
 *~
 *.swp
 build
+/bin
+.classpath
+.project

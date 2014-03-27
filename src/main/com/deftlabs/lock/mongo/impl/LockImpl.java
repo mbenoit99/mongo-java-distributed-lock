@@ -28,14 +28,16 @@ import org.bson.types.ObjectId;
 // Java
 import java.util.Queue;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.locks.LockSupport;
 
 /**
- * The distributed lock object.
+ * The distributed lock object. Note that this lock implementation is not re-entrant. Once you
+ * acquire the lock, an attempt by the same thread to re-acquire it by calling {@code lock()}
+ * will result in a deadlock. Additionally, {@code tryLock()} will return {@code false} even when
+ * invoked by the thread that currently holds the lock.
  */
 public class LockImpl implements DistributedLock {
 
@@ -53,6 +55,11 @@ public class LockImpl implements DistributedLock {
         _svcOptions = pSvcOptions;
     }
 
+    /**
+     * Blocks until the distributed lock is available. Note that this lock is not re-entrant.
+     * Once a thread acquires the lock, it should NOT call lock() again prior to unlocking,
+     * otherwise it will deadlock itself.
+     */
     @Override public void lock() {
         if (tryDistributedLock()) return;
         park();
@@ -75,14 +82,17 @@ public class LockImpl implements DistributedLock {
 
             if (Thread.interrupted()) { wasInterrupted = true; break; }
 
-            if (_waitingThreads.peek() == current && !isLocked()) {
+            if (_waitingThreads.peek() == current && isUnlocked()) {
                 // Check to see if this thread can get the distributed lock
                 if (tryDistributedLock()) break;
             }
         }
 
+        // We can't just remove the head here, because the current thread may not be
+        // at the head of the queue (ie, if the thread was interrupted). Thus find and remove
+        // the current thread from the queue.
+        _waitingThreads.remove(current);
         if (wasInterrupted) current.interrupt();
-        else _waitingThreads.remove();
     }
 
     /**
@@ -112,7 +122,7 @@ public class LockImpl implements DistributedLock {
 
             if (Thread.interrupted()) { wasInterrupted = true; break; }
 
-            if (_waitingThreads.peek() == current && !isLocked()) {
+            if (_waitingThreads.peek() == current && isUnlocked()) {
                 // Check to see if this thread can get the distributed lock
                 if (tryDistributedLock()) { locked = true; break; }
             }
@@ -120,14 +130,11 @@ public class LockImpl implements DistributedLock {
             if ((System.nanoTime() - startTime) >= pNanos) break;
         }
 
-        // TODO: There is a problem here... we need to be able to remove
-        // the actual thread, not just the head. This is causing an issue
-        // where we are removing other threads.
-
-
-        if (wasInterrupted) { current.interrupt(); return locked; }
-        else _waitingThreads.remove();
-
+        // We can't just remove the head here, because the current thread may not be
+        // at the head of the queue (ie, if the park() timed out). Thus find and remove
+        // the current thread from the queue.
+        _waitingThreads.remove(current);
+        if (wasInterrupted) current.interrupt();
         return locked;
     }
 
@@ -135,14 +142,14 @@ public class LockImpl implements DistributedLock {
      * Try and lock the distributed lock.
      */
     private boolean tryDistributedLock() {
-        if (isLocked()) return false;
-
         final ObjectId lockId = LockDao.lock(_mongo, _name, _svcOptions, _lockOptions);
 
         if (lockId == null) return false;
 
         _locked.set(true);
         _lockId = lockId;
+        _lastHeartbeat = System.currentTimeMillis();
+        
         return true;
     }
 
@@ -162,27 +169,28 @@ public class LockImpl implements DistributedLock {
      * Does not block. Returns right away if not able to lock.
      */
     @Override public boolean tryLock() {
-        if (isLocked()) return false;
-
-        final ObjectId lockId = LockDao.lock(_mongo, _name, _svcOptions, _lockOptions);
-
-        if (lockId == null) return false;
-
-        _locked.set(true);
-        _lockId = lockId;
-        return true;
+        if (isLockedLocally()) return false;
+        return tryDistributedLock();
     }
 
     @Override public boolean tryLock(final long pTime, final TimeUnit pTimeUnit) {
+        if (isLockedLocally()) return false;
         if (tryDistributedLock()) return true;
         return park(pTimeUnit.toNanos(pTime));
     }
 
     @Override public void unlock() {
-        LockDao.unlock(_mongo, _name, _svcOptions, _lockOptions, _lockId);
-        _locked.set(false);
-        _lockId = null;
-        LockSupport.unpark(_waitingThreads.peek());
+        try {
+            LockDao.unlock(_mongo, _name, _svcOptions, _lockOptions, _lockId);
+        }
+        finally {
+            // Even if the DB update fails, we still want to re-initialize the lock
+            // state to unlock it locally. Otherwise a DB failure would leave this
+            // lock locked locally until the process dies. Also, the lock timeout will
+            // ensure that a failed DB unlock will eventually release the lock.
+            clear();
+            LockSupport.unpark(_waitingThreads.peek());
+        }
     }
 
     /**
@@ -204,9 +212,47 @@ public class LockImpl implements DistributedLock {
     }
 
     /**
-     * Returns true if the lock is currently locked.
+     * Returns true if the lock is currently locked. If the lock's heartbeat is too old,
+     * attempt to re-acquire the distributed lock. When a long-running process is holding
+     * the lock, it should periodically invoke isLocked() and stop whatever it's doing if
+     * it no longer holds the lock. Be aware that this method has a side effect: if we
+     * think we have the lock and then realize it was lost, this lock will be marked as
+     * unlocked. As a result, if you lose a lock that you had previously acquired, you
+     * should *not* attempt to unlock it. Doing so will clear out the lock state for
+     * a thread that may have since acquired the lock.
      */
-    @Override public boolean isLocked() { return _locked.get(); }
+    @Override public boolean isLocked() {
+        if (isUnlocked()) {
+            return false;
+        }
+        if (!isHeartbeatTooOld()) {
+            return true;
+        }
+        final boolean gotLockBack = tryDistributedLock();
+        if (!gotLockBack) {
+            // Couldn't get the lock back, so clear it out. Although we are effectively
+            // unlocking the lock here, there is no need to invoke these two operations:
+            // LockSupport.unpark() - we already know the distributed lock is not
+            //   currently available, so any waiting threads should keep waiting.
+            // LockDao.unlock() - another process has acquired the lock at this point,
+            //   so invoking the DAO's unlock() method would be disastrous.
+            clear();
+        }
+        return gotLockBack;
+    }
+    
+    /**
+     * Returns true if this lock is being held by the current process. It's possible that
+     * the lock may have timed out (ie, due to a failure to update the heartbeat), in which
+     * case another process may have acquired the lock.
+     */
+    private boolean isLockedLocally() {
+        return _locked.get() == true;
+    }
+    
+    private boolean isUnlocked() {
+        return _locked.get() == false;
+    }
 
     /**
      * Returns the lock name.
@@ -225,12 +271,46 @@ public class LockImpl implements DistributedLock {
      * not the user.
      */
     @Override public void wakeupBlocked() { LockSupport.unpark(_waitingThreads.peek()); }
+    
+    @Override public void setLastHeartbeat(final long pWhen) {
+        _lastHeartbeat = pWhen;
+    }
+    
+    /*
+     * Checks whether the lock has timed out since the last heartbeat was reported.
+     */
+    private boolean isHeartbeatTooOld() {
+        final long age = System.currentTimeMillis() - _lastHeartbeat;
+        return age > _lockOptions.getInactiveLockTimeout();
+    }
+    
+    /**
+     * Clears out all locking state.
+     */
+    private void clear() {
+        _locked.set(false);
+        _lockId = null;
+        _lastHeartbeat = 0;
+    }
 
+    @Override
+    public String toString() {
+        return String.format(
+            "[%d / %s] lastHeartbeat=%s, lockId=%s, locked=%s, numWaiters=%d",
+            hashCode(),
+            _name,
+            _lastHeartbeat,
+            _lockId,
+            _locked.get(),
+            _waitingThreads.size());
+    }
+    
     private final String _name;
     private final Mongo _mongo;
     private final DistributedLockOptions _lockOptions;
     private final DistributedLockSvcOptions _svcOptions;
 
+    private volatile long _lastHeartbeat = 0;
     private volatile ObjectId _lockId;
     private final AtomicBoolean _locked = new AtomicBoolean(false);
     private final AtomicBoolean _running = new AtomicBoolean(false);

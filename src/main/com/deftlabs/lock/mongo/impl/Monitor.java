@@ -62,6 +62,7 @@ final class Monitor {
                 if (!lock.isLocked() || lockId == null) continue;
 
                 LockDao.heartbeat(_mongo, lockName, lockId, lock.getOptions(), _svcOptions);
+                lock.setLastHeartbeat(System.currentTimeMillis());
             }
 
             return _shutdown.await(_svcOptions.getHeartbeatFrequency(), TimeUnit.MILLISECONDS);
